@@ -1,0 +1,6 @@
+[INFO] Initializing application...
+[INFO] Loading configuration...
+[ERROR] Out of memory: Process killed
+[WARN] Memory usage exceeded 90%
+[ERROR] Critical module failed to load
+[FATAL] Server crashed due to unhandled exception
