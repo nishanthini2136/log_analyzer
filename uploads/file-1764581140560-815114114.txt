@@ -1,0 +1,6 @@
+[INFO] Server started at 2025-11-20 10:15:00
+[ERROR] Database connection failed at 2025-11-20 10:16:22
+[WARN] Retrying database connection...
+[ERROR] Authentication token expired
+[INFO] Request aborted by client
+[ERROR] File upload failed: Disk quota exceeded

@@ -1,266 +1,209 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
-import dotenv from "dotenv";
-import crypto from 'crypto';
-import { promises as fs } from 'fs';
-import path from 'path';
-
-// Load environment variables
-dotenv.config();
-
-// Configuration
-const CONFIG = {
-  MAX_LOG_SIZE: 5 * 1024 * 1024, // 5MB
-  CACHE_DIR: path.join(process.cwd(), '.cache'),
-  CACHE_TTL: 24 * 60 * 60 * 1000, // 24 hours
-  SUPPORTED_FILE_TYPES: ['.log', '.txt', '.json'],
-  REDACT_PATTERNS: {
-    IP: /(\d{1,3}\.){3}\d{1,3}/g,
-    EMAIL: /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g,
-    API_KEY: /(?:key|api[_-]?key|token|secret)[=:]["']?([a-zA-Z0-9_\-]{20,})["']?/gi,
-    URL: /(https?:\/\/[^\s]+)/g,
-    FILE_PATH: /(\/[\w\-\.]+)+/g,
-    TIMESTAMP: /\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?/g,
-    CREDIT_CARD: /\b(?:\d[ -]*?){13,16}\b/g,
-    SSN: /\b\d{3}[-.]?\d{2}[-.]?\d{4}\b/g
-  }
-};
-
-// Validate API key
-if (!process.env.GEMINI_API_KEY) {
-  console.error('❌ Error: GEMINI_API_KEY is not set in .env file');
-  process.exit(1);
-}
-
-// Initialize the Gemini API client
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-
-/**
- * Redacts sensitive information from log content
- * @param {string} content - The log content to redact
- * @returns {string} Redacted log content
- */
-function redactSensitiveInfo(content) {
-  let redacted = content;
-  Object.values(CONFIG.REDACT_PATTERNS).forEach(pattern => {
-    redacted = redacted.replace(pattern, '[REDACTED]');
-  });
-  return redacted;
-}
-
-/**
- * Generates a SHA-256 hash of the content for deduplication
- * @param {string} content - The content to hash
- * @returns {string} Hex-encoded SHA-256 hash
- */
-function generateContentHash(content) {
-  return crypto
-    .createHash('sha256')
-    .update(content)
-    .digest('hex');
-}
-
-/**
- * Gets the cache file path for a given hash
- * @param {string} hash - The content hash
- * @returns {string} Cache file path
- */
-function getCachePath(hash) {
-  return path.join(CONFIG.CACHE_DIR, `${hash}.json`);
-}
-
-/**
- * Checks if a cache entry exists and is still valid
- * @param {string} hash - The content hash
- * @returns {Promise<object|null>} Cached result or null if not found/expired
- */
-async function getCachedResult(hash) {
+export async function analyzeWithAI(logText) {
   try {
-    const cachePath = getCachePath(hash);
-    const stats = await fs.stat(cachePath);
-    
-    // Check if cache is expired
-    if (Date.now() - stats.mtimeMs > CONFIG.CACHE_TTL) {
-      return null; // Cache expired
-    }
-    
-    const data = await fs.readFile(cachePath, 'utf-8');
-    return JSON.parse(data);
-  } catch (error) {
-    return null; // Cache miss
-  }
-}
+    const text = (logText || '').toString();
+    const lower = text.toLowerCase();
 
-/**
- * Saves the analysis result to cache
- * @param {string} hash - The content hash
- * @param {object} result - The analysis result to cache
- */
-async function saveToCache(hash, result) {
-  try {
-    // Ensure cache directory exists
-    await fs.mkdir(CONFIG.CACHE_DIR, { recursive: true });
-    
-    const cachePath = getCachePath(hash);
-    await fs.writeFile(
-      cachePath,
-      JSON.stringify({
-        ...result,
-        cachedAt: new Date().toISOString(),
-        expiresAt: new Date(Date.now() + CONFIG.CACHE_TTL).toISOString()
-      }),
-      'utf-8'
-    );
-  } catch (error) {
-    console.error('❌ Failed to save to cache:', error);
-    // Don't fail the request if cache save fails
-  }
-}
+    let issueType = 'No critical issues detected';
+    let rootCause =
+      'No obvious error signatures were found in the provided logs. The service appears healthy based on the available information.';
+    let suggestedFix = [
+      'Continue monitoring logs for new errors or spikes in latency.',
+      'Set up alerts on error rate, latency and resource usage if not already in place.',
+    ];
+    let severity = 'Low';
+    let category = 'informational';
+    let confidence = 50;
+    let relatedLogs = [];
 
-/**
- * Analyzes log content using AI
- * @param {string} log - The log content to analyze
- * @param {object} options - Additional options
- * @param {boolean} options.force - Force analysis even if cached
- * @returns {Promise<object>} Analysis result
- */
-export async function analyzeWithAI(log, { force = false } = {}) {
-  const startTime = Date.now();
-  
-  try {
-    // Validate input
-    if (!log || typeof log !== 'string' || log.trim() === '') {
-      throw new Error('Log content is empty or invalid');
-    }
-
-    // Check log size
-    if (Buffer.byteLength(log, 'utf8') > CONFIG.MAX_LOG_SIZE) {
-      throw new Error(`Log exceeds maximum size of ${CONFIG.MAX_LOG_SIZE / (1024 * 1024)}MB`);
-    }
-
-    // Redact sensitive information
-    const redactedLog = redactSensitiveInfo(log);
-    const logHash = generateContentHash(redactedLog);
-    
-    // Check cache first if not forced
-    if (!force) {
-      const cached = await getCachedResult(logHash);
-      if (cached) {
-        console.log(`ℹ️ Using cached result for log hash: ${logHash}`);
-        return { ...cached, cached: true };
-      }
-    }
-
-    console.log(`🔍 Analyzing log (${log.length} chars, hash: ${logHash})...`);
-    
-    // Initialize the AI model (use a supported Gemini model)
-    const model = genAI.getGenerativeModel({
-      model: "gemini-1.5-flash",
-      generationConfig: {
-        temperature: 0.1,
-        topP: 0.1,
-        maxOutputTokens: 2048
-      },
-      safetySettings: [
-        { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-        { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-        { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-        { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
-      ]
-    });
-
-    // Construct the analysis prompt
-    const prompt = `You are an expert log analyzer. Analyze the following log and provide a JSON response with:
-    
-    {
-      "issueType": "The type of issue (e.g., 'Database Connection Error', 'High CPU Usage')",
-      "rootCause": "Detailed explanation of the root cause",
-      "suggestedFix": ["Step 1: Action to fix the issue", "Step 2: Next step"],
-      "severity": "Low | Medium | High | Critical",
-      "category": "One of: 'network', 'database', 'application', 'security', 'performance', 'authentication', 'authorization', 'configuration', 'resource', 'unknown'",
-      "confidence": "Your confidence in this analysis (0-100)",
-      "relatedLogs": ["patterns or keywords that would help identify similar issues"]
-    }
-
-    Log to analyze (redacted for sensitive information):
-    ${redactedLog}
-    
-    Respond with valid JSON only, no additional text.`;
-
-    // Call the AI API
-    console.log('🤖 Sending request to Gemini API...');
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    
-    if (!response || !response.text) {
-      throw new Error('No valid response from AI service');
-    }
-
-    const text = response.text();
-    console.log('📥 Raw AI response received');
-
-    // Parse and validate the response
-    try {
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        throw new Error('No JSON found in AI response');
-      }
-
-      const parsed = JSON.parse(jsonMatch[0]);
-      
-      // Validate required fields
-      const requiredFields = [
-        'issueType', 'rootCause', 'suggestedFix', 
-        'severity', 'category', 'confidence'
-      ];
-      const missingFields = requiredFields.filter(field => !(field in parsed));
-      
-      if (missingFields.length > 0) {
-        throw new Error(`Missing required fields in AI response: ${missingFields.join(', ')}`);
-      }
-
-      // Prepare the result
-      const analysisResult = {
-        success: true,
-        analysis: {
-          ...parsed,
-          logHash,
-          analyzedAt: new Date().toISOString(),
-          processingTimeMs: Date.now() - startTime
+    const patterns = [
+      {
+        name: 'http_5xx',
+        match: /\s(5\d{2})\s|500 Internal Server Error|HTTP 500/i,
+        update: () => {
+          issueType = 'HTTP 5xx server error';
+          rootCause =
+            'The logs show HTTP 5xx responses being returned to clients, indicating a server-side failure in handling requests.';
+          suggestedFix = [
+            'Inspect stack traces around the time of the 5xx responses to identify failing code paths.',
+            'Check upstream dependencies (databases, external APIs) for errors or timeouts that could cause the server to fail.',
+            'Add more structured logging (request id, user id, endpoint) around failing endpoints to narrow down the problem.',
+          ];
+          severity = 'High';
+          category = 'runtime';
+          confidence = 80;
+          relatedLogs = ['HTTP 500', 'HTTP 502', 'HTTP 503', 'Unhandled exception'];
         },
-        metadata: {
-          logSize: log.length,
-          redactedLogSize: redactedLog.length,
-          cacheHit: false
-        }
-      };
+      },
+      {
+        name: 'timeout',
+        match: /timeout|timed out|ESOCKETTIMEDOUT|ETIMEDOUT/i,
+        update: () => {
+          issueType = 'Request or dependency timeout';
+          rootCause =
+            'The logs contain timeout errors, suggesting that a downstream dependency or network call is not responding within the expected time.';
+          suggestedFix = [
+            'Identify which external service or database call is timing out and measure its typical response time.',
+            'Increase the timeout threshold only if the dependency is known to be slow and cannot be optimized.',
+            'Add retries with backoff and better error handling around slow network calls.',
+          ];
+          severity = 'High';
+          category = 'infrastructure';
+          confidence = 75;
+          relatedLogs = ['ETIMEDOUT', 'ESOCKETTIMEDOUT', 'request timeout'];
+        },
+      },
+      {
+        name: 'db_connection',
+        match:
+          /ECONNREFUSED.*(postgres|mysql|mongo|database)|database connection failed|could not connect to server/i,
+        update: () => {
+          issueType = 'Database connection failure';
+          rootCause =
+            'The application is unable to establish or maintain a connection to the database. This can be due to configuration errors, network issues, or the database server being down.';
+          suggestedFix = [
+            'Verify database host, port, username, password and database name in the application configuration or environment variables.',
+            'Check if the database server is running and reachable from the application host (e.g., using ping or telnet).',
+            'Confirm that firewall rules and security groups allow traffic between the application and the database.',
+          ];
+          severity = 'Critical';
+          category = 'database';
+          confidence = 85;
+          relatedLogs = ['ECONNREFUSED', 'connection refused', 'could not connect to server'];
+        },
+      },
+      {
+        name: 'db_query',
+        match:
+          /(SQLSTATE|syntax error at or near|duplicate key value violates unique constraint|deadlock detected)/i,
+        update: () => {
+          issueType = 'Database query error';
+          rootCause =
+            'The database is rejecting one or more queries, indicating problems such as invalid SQL syntax, constraint violations, or deadlocks.';
+          suggestedFix = [
+            'Inspect the failing SQL statement and verify table/column names, parameter types, and join conditions.',
+            'Handle unique constraint violations by checking for existing records before inserts or using upserts where appropriate.',
+            'If deadlocks occur, review transaction scope and lock usage to reduce contention.',
+          ];
+          severity = 'High';
+          category = 'database';
+          confidence = 80;
+          relatedLogs = ['SQLSTATE', 'syntax error', 'duplicate key', 'deadlock detected'];
+        },
+      },
+      {
+        name: 'auth',
+        match: /unauthorized|forbidden|401|403|invalid token|jwt/i,
+        update: () => {
+          issueType = 'Authentication or authorization failure';
+          rootCause =
+            'The logs show repeated authentication or authorization errors, suggesting invalid credentials, expired tokens, or misconfigured access control.';
+          suggestedFix = [
+            'Verify token issuance (expiration time, audience, issuer) and ensure the API is validating them correctly.',
+            'Check role/permission mappings to make sure users have the required access for the actions they are performing.',
+            'Add clearer error messages and correlation ids for failed auth requests to aid debugging.',
+          ];
+          severity = 'Medium';
+          category = 'security';
+          confidence = 70;
+          relatedLogs = ['401 Unauthorized', '403 Forbidden', 'invalid token'];
+        },
+      },
+      {
+        name: 'oom',
+        match: /out of memory|heap limit|JavaScript heap out of memory|ENOMEM/i,
+        update: () => {
+          issueType = 'Out-of-memory condition';
+          rootCause =
+            'The process is running out of memory, which typically indicates a memory leak or workloads that exceed the available resources.';
+          suggestedFix = [
+            'Capture heap snapshots and analyze object retention to identify memory leaks.',
+            'Review caching and in-memory data structures for unbounded growth.',
+            'Increase memory limits for the service only after confirming that memory usage patterns are expected.',
+          ];
+          severity = 'Critical';
+          category = 'performance';
+          confidence = 85;
+          relatedLogs = ['heap out of memory', 'ENOMEM', 'Out of memory'];
+        },
+      },
+      {
+        name: 'generic_error',
+        match: /exception|stack trace|unhandled rejection|fatal error|TypeError|ReferenceError/i,
+        update: () => {
+          issueType = 'Application runtime error';
+          rootCause =
+            'The logs show runtime exceptions being thrown by the application, which likely stem from unhandled edge cases, null values, or incorrect assumptions in the code.';
+          suggestedFix = [
+            'Review the stack trace to locate the exact function and line where the exception originates.',
+            'Add input validation and null checks around the failing code path.',
+            'Introduce structured error handling (try/catch, centralized error middleware) to catch and log exceptions consistently.',
+          ];
+          severity = 'High';
+          category = 'runtime';
+          confidence = 75;
+          relatedLogs = ['Unhandled exception', 'TypeError', 'ReferenceError', 'stack trace'];
+        },
+      },
+      {
+        name: 'warning_only',
+        match: /warn|deprecated|slow query|high latency/i,
+        update: () => {
+          issueType = 'Performance or warning signals detected';
+          rootCause =
+            'The logs primarily contain warnings or performance-related messages (such as slow queries or elevated latency) rather than hard failures.';
+          suggestedFix = [
+            'Identify the endpoints or queries that show the highest latency and profile them.',
+            'Optimize slow database queries using indexes, query rewrites, or caching.',
+            'Set SLOs (service level objectives) and alerting thresholds for latency and error rate.',
+          ];
+          severity = 'Medium';
+          category = 'performance';
+          confidence = 65;
+          relatedLogs = ['WARN', 'slow query', 'high latency'];
+        },
+      },
+    ];
 
-      // Cache the result for future use
-      await saveToCache(logHash, analysisResult);
-      
-      console.log(`✅ Analysis completed in ${analysisResult.analysis.processingTimeMs}ms`);
-      return analysisResult;
-
-    } catch (parseError) {
-      console.error('❌ Error parsing AI response:', parseError);
-      throw new Error(`Failed to parse AI response: ${parseError.message}`);
+    const matched = patterns.find((p) => p.match.test(text));
+    if (matched) {
+      matched.update();
+    } else if (/error|fail(ed)?/i.test(text)) {
+      issueType = 'Generic error detected';
+      rootCause =
+        'The logs contain error keywords but do not match a more specific pattern. There is likely a failure that requires manual inspection of the stack trace and recent changes.';
+      suggestedFix = [
+        'Inspect error messages and stack traces around the time of failure.',
+        'Correlate the error with recent code or configuration changes.',
+        'Add structured logging (request id, user id, feature flags) to improve observability.',
+      ];
+      severity = 'Medium';
+      category = 'runtime';
+      confidence = 60;
+      relatedLogs = ['error', 'failed', 'stack trace'];
     }
 
-  } catch (error) {
-    const errorInfo = {
-      message: error.message,
-      code: error.code || 'AI_SERVICE_ERROR',
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined,
-      processingTimeMs: Date.now() - startTime
+    const analysis = {
+      issueType,
+      rootCause,
+      suggestedFix,
+      severity,
+      category,
+      confidence,
+      relatedLogs,
     };
 
-    console.error('❌ AI Service Error:', errorInfo);
-    
+    return {
+      success: true,
+      analysis,
+      metadata: {
+        model: 'pattern-based-log-analyzer',
+        timestamp: new Date().toISOString(),
+      },
+    };
+  } catch (error) {
     return {
       success: false,
-      error: errorInfo,
-      metadata: {
-        processingTimeMs: errorInfo.processingTimeMs
-      }
+      error,
     };
   }
 }
